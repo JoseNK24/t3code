@@ -5,7 +5,12 @@ import { vi } from "vite-plus/test";
 
 import * as CursorSdk from "./CursorSdk.ts";
 
-vi.mock("./sdk.ts", () => ({ Agent: {}, createAgentPlatform: {}, SqliteLocalAgentStore: {} }));
+vi.mock("./sdk.ts", () => ({
+  Agent: {},
+  createAgentPlatform: {},
+  getDefaultSdkStateRoot: {},
+  SqliteLocalAgentStore: {},
+}));
 
 // Shaped like the SDK's minified class: the constructor is not named after the error.
 class o extends Error {

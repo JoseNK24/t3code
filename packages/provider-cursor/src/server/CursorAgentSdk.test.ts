@@ -6,6 +6,7 @@ import * as Layer from "effect/Layer";
 import { vi } from "vite-plus/test";
 
 import * as ProviderEventLoggers from "@t3tools/provider-core/server/ProviderEventLoggers";
+import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as CursorAgentSdk from "./CursorAgentSdk.ts";
 import * as CursorSdk from "./CursorSdk.ts";
 
@@ -73,8 +74,16 @@ const cursorSdkMock = vi.hoisted(() => {
     staleRunActive = false;
   });
 
+  const getDefaultSdkStateRoot = vi.fn(
+    (cwd: string) =>
+      `C:\\Users\\felip\\.cursor\\projects\\${cwd.replace(/[^a-zA-Z0-9]+/g, "-")}\\sdk-agent-store\\${"a".repeat(64)}`,
+  );
+  const openStore = vi.fn(async () => ({ kind: "short-windows-store" }));
+
   return {
     agentClose,
+    getDefaultSdkStateRoot,
+    openStore,
     cancelRun,
     closeExecutionOrder,
     create,
@@ -104,7 +113,8 @@ vi.mock("./sdk.ts", () => ({
     },
   },
   createAgentPlatform: vi.fn(),
-  SqliteLocalAgentStore: { open: vi.fn() },
+  getDefaultSdkStateRoot: cursorSdkMock.getDefaultSdkStateRoot,
+  SqliteLocalAgentStore: { open: cursorSdkMock.openStore },
 }));
 
 const layerTest = CursorAgentSdk.layer.pipe(
@@ -171,5 +181,48 @@ describe("CursorAgentSdkRunner", () => {
         },
       ]);
     }).pipe(Effect.provide(layerTest)),
+  );
+
+  it.effect("keeps Windows agent stores under MAX_PATH for deep workspaces", () =>
+    Effect.gen(function* () {
+      cursorSdkMock.resume.mockClear();
+      cursorSdkMock.openStore.mockClear();
+      const deepCwd = "C:\\Users\\felip\\OneDrive\\Documentos\\GitHub\\Dungoban.Monogame";
+      const runner = yield* CursorAgentSdk.makeCursorAgentSdkRunner(() => undefined).pipe(
+        Effect.provideService(HostProcess.Platform, "win32"),
+        Effect.provideService(HostProcess.HomeDirectory, "C:\\Users\\felip"),
+      );
+      const open = (cwd: string) =>
+        runner.open({
+          operation: "resume",
+          agentId: "agent-cursor-agent-sdk-test",
+          options: { model: { id: "default" }, mode: "agent", local: { cwd } },
+          threadId: ThreadId.make("thread-cursor-agent-sdk-windows-store-test"),
+          providerSessionId: ProviderSessionId.make(
+            "provider-session-cursor-agent-sdk-windows-store-test",
+          ),
+        });
+
+      yield* open(deepCwd);
+      yield* open(deepCwd);
+      yield* open("C:\\src\\game");
+
+      assert.deepStrictEqual(cursorSdkMock.openStore.mock.calls, [
+        [
+          {
+            workspaceRef: deepCwd,
+            stateRoot: `C:\\Users\\felip\\.t3\\cursor-sdk\\${"a".repeat(16)}`,
+          },
+        ],
+      ]);
+      const stores = cursorSdkMock.resume.mock.calls.map(
+        (call) => (call as unknown as [string, { local: { store?: unknown } }])[1].local.store,
+      );
+      assert.deepStrictEqual(stores, [
+        { kind: "short-windows-store" },
+        { kind: "short-windows-store" },
+        undefined,
+      ]);
+    }).pipe(Effect.provide(CursorSdk.layer)),
   );
 });

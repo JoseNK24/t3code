@@ -2,6 +2,7 @@ import type {
   AgentMessage,
   AgentOptions,
   InteractionUpdate,
+  LocalAgentStore,
   RunResult,
   SDKUserMessage,
   SendOptions,
@@ -20,6 +21,7 @@ import * as Schema from "effect/Schema";
 
 import * as CursorSdk from "./CursorSdk.ts";
 import * as ProviderEventLoggers from "@t3tools/provider-core/server/ProviderEventLoggers";
+import * as HostProcess from "@t3tools/shared/HostProcess";
 
 export const CURSOR_AGENT_SDK_PROTOCOL = "cursor-agent-sdk.local" as const;
 export const CURSOR_PROVIDER = ProviderDriverKind.make("cursor");
@@ -322,10 +324,67 @@ function makeCursorAgentSdkProtocolLogger(input: {
       .pipe(Effect.ignore);
 }
 
+// Windows SQLite cannot open paths of MAX_PATH (260) or more. The SDK's default store nests two
+// SHA-256 segments under ~/.cursor/projects/<workspace slug>, so deep workspaces open store.db but
+// fail its journal on the first write, and the SDK replays the turn from its last checkpoint.
+const WINDOWS_MAX_PATH = 260;
+const SDK_AGENT_STORE_LONGEST_FILE = `\\agents\\agent-${"0".repeat(64)}\\store.db-journal`;
+const SQLITE_SIBLING_FILE_MARGIN = 8;
+
+function cursorShortSdkStateRoot(input: {
+  readonly platform: NodeJS.Platform;
+  readonly homeDirectory: string;
+  readonly defaultStateRoot: string;
+}): string | undefined {
+  if (input.platform !== "win32") return undefined;
+  const longest =
+    input.defaultStateRoot.length +
+    SDK_AGENT_STORE_LONGEST_FILE.length +
+    SQLITE_SIBLING_FILE_MARGIN;
+  if (longest < WINDOWS_MAX_PATH) return undefined;
+  // The default root ends in a hash of the workspace, which keeps workspaces apart here too.
+  const workspaceKey = (input.defaultStateRoot.split(/[\\/]/).at(-1) ?? "").slice(0, 16);
+  return `${input.homeDirectory.replace(/[\\/]+$/, "")}\\.t3\\cursor-sdk\\${workspaceKey}`;
+}
+
 export const makeCursorAgentSdkRunner = Effect.fn("makeCursorAgentSdkRunner")(function* (
   protocolLoggerFor: (input: CursorAgentSdkOpenInput) => CursorAgentSdkProtocolLogger | undefined,
 ) {
-  const { Agent, createAgentPlatform } = yield* CursorSdk.CursorSdk;
+  const { Agent, createAgentPlatform, getDefaultSdkStateRoot, SqliteLocalAgentStore } =
+    yield* CursorSdk.CursorSdk;
+  const platform = yield* HostProcess.Platform;
+  const homeDirectory = yield* HostProcess.HomeDirectory;
+
+  const shortStores = new Map<string, Promise<LocalAgentStore>>();
+  const withShortWindowsStore = Effect.fn("CursorAgentSdkRunner.withShortWindowsStore")(function* (
+    options: AgentOptions,
+  ) {
+    const local = options.local;
+    const cwd = typeof local?.cwd === "string" ? local.cwd : local?.cwd?.[0];
+    if (local === undefined || local.store !== undefined || cwd === undefined) {
+      return options;
+    }
+    const stateRoot = cursorShortSdkStateRoot({
+      platform,
+      homeDirectory,
+      defaultStateRoot: getDefaultSdkStateRoot(cwd),
+    });
+    if (stateRoot === undefined) {
+      return options;
+    }
+    const store = yield* Effect.tryPromise({
+      try: () => {
+        const existing = shortStores.get(stateRoot);
+        if (existing !== undefined) return existing;
+        const opened = SqliteLocalAgentStore.open({ workspaceRef: cwd, stateRoot });
+        shortStores.set(stateRoot, opened);
+        opened.catch(() => shortStores.delete(stateRoot));
+        return opened;
+      },
+      catch: (cause) => runnerError(cause, "agent.store.open"),
+    });
+    return { ...options, local: { ...local, store } } satisfies AgentOptions;
+  });
 
   // Prime with cursorsandbox before any Full access run; the SDK caches sandbox support per process.
   const sandboxSupportPrimeStarted = yield* Ref.make(false);
@@ -352,7 +411,8 @@ export const makeCursorAgentSdkRunner = Effect.fn("makeCursorAgentSdkRunner")(fu
   );
 
   return CursorAgentSdkRunner.of({
-    open: Effect.fn("CursorAgentSdkRunner.open")(function* (input) {
+    open: Effect.fn("CursorAgentSdkRunner.open")(function* (openInput) {
+      const input = { ...openInput, options: yield* withShortWindowsStore(openInput.options) };
       if (input.options.local?.sandboxOptions?.enabled === false) {
         yield* primeCursorSandboxSupport(input.options);
       }
@@ -565,11 +625,7 @@ export const makeCursorAgentSdkRunner = Effect.fn("makeCursorAgentSdkRunner")(fu
         }).pipe(
           Effect.andThen(
             Effect.tryPromise({
-              try: () =>
-                Agent.messages.list(agent.agentId, {
-                  runtime: "local",
-                  ...(cwd === undefined ? {} : { cwd }),
-                }),
+              try: () => Agent.messages.list(agent.agentId, runOptions),
               catch: (cause) => runnerError(cause, "agent.messages.list"),
             }),
           ),

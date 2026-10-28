@@ -3,7 +3,12 @@ import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 
-import { Agent, createAgentPlatform, SqliteLocalAgentStore } from "./sdk.ts";
+import {
+  Agent,
+  createAgentPlatform,
+  getDefaultSdkStateRoot,
+  SqliteLocalAgentStore,
+} from "./sdk.ts";
 
 // The SDK leaves a shell-error promise unhandled, which would exit the server.
 const CURSOR_SHELL_SPAWN_MARKERS = [
@@ -62,6 +67,7 @@ export class CursorSdk extends Context.Service<
   {
     readonly Agent: typeof Agent;
     readonly createAgentPlatform: typeof createAgentPlatform;
+    readonly getDefaultSdkStateRoot: typeof getDefaultSdkStateRoot;
     readonly SqliteLocalAgentStore: typeof SqliteLocalAgentStore;
   }
 >()("@t3tools/provider-cursor/server/CursorSdk") {}
@@ -77,5 +83,9 @@ export const layer = Layer.effect(
       Effect.sync(() => {
         process.off("unhandledRejection", onUnhandledRejection);
       }),
-  ).pipe(Effect.as(CursorSdk.of({ Agent, createAgentPlatform, SqliteLocalAgentStore }))),
+  ).pipe(
+    Effect.as(
+      CursorSdk.of({ Agent, createAgentPlatform, getDefaultSdkStateRoot, SqliteLocalAgentStore }),
+    ),
+  ),
 );
